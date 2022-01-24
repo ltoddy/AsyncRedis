@@ -1,0 +1,11 @@
+[package]
+name = "async_redis"
+version = "0.1.0"
+edition = "2021"
+authors = ["liutao.rs <liutao.rs@bytedance.com>"]
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+description = "Redis library for rust using tokio"
+
+[dependencies]
+tokio = "1.15"
