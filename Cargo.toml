@@ -8,4 +8,7 @@ readme = "README.md"
 description = "Redis library for rust using tokio"
 
 [dependencies]
-tokio = "1.15"
+tokio = { version = "1.15", features = ["net", "io-util"] }
+
+[dev-dependencies]
+tokio = { version = "1.15", default-features = false, features = ["macros", "rt"] }
