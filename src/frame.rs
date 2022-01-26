@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::io::Cursor;
 
 use bytes::{Buf, Bytes};
@@ -21,6 +19,15 @@ impl std::fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+impl Error {
+    fn due_to_protocol<S>(reason: S) -> Error
+    where
+        S: ToString,
+    {
+        Error::Protocol(reason.to_string())
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Frame {
@@ -45,63 +52,79 @@ impl Frame {
         }
         let first = src.get_u8();
         match first {
-            Self::SIMPLE => Self::parse_simple(src),
-            Self::ERRORS => Self::parse_error(src),
-            Self::INTEGERS => Self::parse_integer(src),
-            Self::BULK => Self::parse_bulk(src),
-            Self::ARRAY => Self::parse_array(src),
-            actual => return Err(Error::Protocol(format!("invalid frame type byte `{actual}`"))),
+            Frame::SIMPLE => Frame::parse_simple(src),
+            Frame::ERRORS => Frame::parse_error(src),
+            Frame::INTEGERS => Frame::parse_integer(src),
+            Frame::BULK => Frame::parse_bulk(src),
+            Frame::ARRAY => Frame::parse_array(src),
+            actual => Err(Error::due_to_protocol(format!("invalid frame type byte `{actual}`"))),
         }
     }
 
     fn parse_simple(src: &mut Cursor<&[u8]>) -> Result<Frame, Error> {
-        let start = src.position() as usize;
-        let end = src.get_ref().len() - 1;
-        for i in start..end {
-            if src.get_ref()[i] == b'\r' && src.get_ref()[i + 1] == b'\n' {
-                src.set_position((i + 2) as u64);
-                let string = String::from_utf8_lossy(&src.get_ref()[start..i]);
-                return Ok(Frame::Simple(string.into()));
-            }
-        }
-        Err(Error::StreamEndedEarly)
+        let line = Frame::read_line(src)?;
+        Ok(Frame::Simple(String::from_utf8_lossy(line).into()))
     }
 
     fn parse_error(src: &mut Cursor<&[u8]>) -> Result<Frame, Error> {
-        let start = src.position() as usize;
-        let end = src.get_ref().len() - 1;
-        for i in start..end {
-            if src.get_ref()[i] == b'\r' && src.get_ref()[i + 1] == b'\n' {
-                src.set_position((i + 2) as u64);
-                let string = String::from_utf8_lossy(&src.get_ref()[start..i]);
-                return Ok(Frame::Error(string.into()));
-            }
-        }
-        Err(Error::StreamEndedEarly)
+        let line = Frame::read_line(src)?;
+        Ok(Frame::Error(String::from_utf8_lossy(line).into()))
     }
 
     fn parse_integer(src: &mut Cursor<&[u8]>) -> Result<Frame, Error> {
+        let line = Frame::read_line(src)?;
+        let integer = atoi::atoi::<u64>(line).ok_or_else(|| Error::due_to_protocol("invalid frame format"))?;
+        Ok(Frame::Integer(integer))
+    }
+
+    fn parse_bulk(src: &mut Cursor<&[u8]>) -> Result<Frame, Error> {
+        if !src.has_remaining() {
+            return Err(Error::StreamEndedEarly);
+        }
+        let first = src.chunk()[0];
+        return match first {
+            b'-' => {
+                let line = Frame::read_line(src)?;
+                if line != b"-1" {
+                    return Err(Error::StreamEndedEarly);
+                }
+                Ok(Frame::Nil)
+            }
+            _ => {
+                let line = Frame::read_line(src)?;
+                let length = atoi::atoi::<u64>(line).ok_or_else(|| Error::due_to_protocol("invalid frame format"))?;
+                let n = (length + 2) as usize;
+                if src.remaining() < n {
+                    return Err(Error::StreamEndedEarly);
+                }
+                let data = Bytes::copy_from_slice(&src.chunk()[..length as usize]);
+                src.advance(n);
+                Ok(Frame::Bulk(data))
+            }
+        };
+    }
+
+    fn parse_array(src: &mut Cursor<&[u8]>) -> Result<Frame, Error> {
+        let line = Frame::read_line(src)?;
+        let length = atoi::atoi::<u64>(line).ok_or_else(|| Error::due_to_protocol("invalid frame format"))?;
+        let mut array = Vec::with_capacity(length as usize);
+
+        for _ in 0..length {
+            array.push(Frame::parse(src)?);
+        }
+        Ok(Frame::Array(array))
+    }
+
+    fn read_line<'a>(src: &mut Cursor<&'a [u8]>) -> Result<&'a [u8], Error> {
         let start = src.position() as usize;
         let end = src.get_ref().len() - 1;
         for i in start..end {
             if src.get_ref()[i] == b'\r' && src.get_ref()[i + 1] == b'\n' {
                 src.set_position((i + 2) as u64);
-                let bytes = &src.get_ref()[start..i];
-                if let Some(integer) = atoi::atoi::<u64>(bytes) {
-                    return Ok(Frame::Integer(integer));
-                }
-                return Err(Error::Protocol(String::from("")));
+                return Ok(&src.get_ref()[start..i]);
             }
         }
         Err(Error::StreamEndedEarly)
-    }
-
-    fn parse_bulk(src: &mut Cursor<&[u8]>) -> Result<Frame, Error> {
-        Err(Error::StreamEndedEarly) // TODO
-    }
-
-    fn parse_array(src: &mut Cursor<&[u8]>) -> Result<Frame, Error> {
-        Err(Error::StreamEndedEarly) // TODO
     }
 }
 
@@ -151,15 +174,22 @@ pub mod test {
     }
 
     #[test]
-    pub fn test_parse_bulk() {}
-
-    #[test]
-    pub fn test_parse_array() {
-        let source = b"*3\r\none\r\ntwo\r\nthree\r\n" as &[u8];
+    pub fn test_parse_bulk() {
+        let source = b"$11\r\nHello world\r\n" as &[u8];
         let mut source = Cursor::new(source);
 
         let frame = Frame::parse(&mut source).unwrap();
-        assert!(matches!(frame, Frame::Array(_)));
-        assert_eq!(Frame::Array(vec![]))
+
+        assert_eq!(Frame::Bulk(Bytes::from(b"Hello world" as &[u8])), frame);
+    }
+
+    #[test]
+    pub fn test_parse_array() {
+        let source = b"*2\r\n+one\r\n+two\r\n" as &[u8];
+        let mut source = Cursor::new(source);
+
+        let frame = Frame::parse(&mut source).unwrap();
+
+        assert_eq!(Frame::Array(vec![Frame::Simple("one".to_owned()), Frame::Simple("two".to_owned()),]), frame);
     }
 }
